@@ -1,2 +1,4 @@
 .env
 bestbuy_*.html
+logs
+state_changes.json
