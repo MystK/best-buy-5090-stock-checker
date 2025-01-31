@@ -3,6 +3,8 @@ import os
 from collections import deque
 import re
 import datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo  # Requires Python 3.9+
 from dotenv import load_dotenv
 import requests
 from twilio.rest import Client
@@ -18,10 +20,9 @@ TO_PHONE = os.getenv("TO_PHONE")
 
 CHECK_URL = os.getenv("CHECK_URL")
 
-# How long to wait between checks in monitor mode (in seconds)
-WAIT_TIME = 60  # 1 minute by default
+# The rest of the code no longer uses a fixed WAIT_TIME; 
+# instead we dynamically compute it based on day/time.
 
-# How many HTML files to keep in test interactive mode (when fetching & saving)
 MAX_SAVED_RESPONSES = 10
 
 # Twilio client
@@ -48,12 +49,31 @@ HEADERS = {
     "sec-fetch-site": "cross-site",
     "sec-fetch-user": "?1",
     "upgrade-insecure-requests": "1",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0"
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0"
 }
 
 # ------------------------------------------------------------------------
-# 2. Extract SKU from CHECK_URL to build the add-to-cart marker
+# 2. Time-Based Logic for Wait Interval
+# ------------------------------------------------------------------------
+def get_current_wait_time_seconds():
+    """
+    Returns how many seconds to wait before the next check.
+    
+    Monday-Friday from 6 AM PT (hour=6) to 1:59 PM PT (hour<14): 1 minute = 60 sec
+    Otherwise: 10 minutes = 600 sec
+    """
+    now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))  # Current Pacific Time
+    # weekday() -> Monday=0, Sunday=6
+    # hour in 24-hr format, so 6 <= hour < 14 covers 6 AM to 1:59:59 PM
+    if now_pt.weekday() < 5 and 6 <= now_pt.hour < 14:
+        return 60   # 1 minute
+    else:
+        return 600  # 10 minutes
+
+# ------------------------------------------------------------------------
+# 3. Extract SKU from CHECK_URL
 # ------------------------------------------------------------------------
 def extract_sku(url):
     """Extracts 'skuId=1234567' from the URL. Returns the digits as a string."""
@@ -70,7 +90,7 @@ if not SKU:
 ADD_TO_CART_MARKER = f'data-sku-id="{SKU}" data-button-state="ADD_TO_CART"'
 
 # ------------------------------------------------------------------------
-# 3. Check Status (Fetch & Determine)
+# 4. Check Status (Fetch & Determine)
 # ------------------------------------------------------------------------
 def check_status(save_html=False, saved_files_queue=None):
     """
@@ -92,7 +112,7 @@ def check_status(save_html=False, saved_files_queue=None):
             current_status = "fail"
 
         if save_html and saved_files_queue is not None:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"bestbuy_{timestamp}_{current_status}.html"
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(page_text)
@@ -113,7 +133,7 @@ def check_status(save_html=False, saved_files_queue=None):
         return "fail"
 
 # ------------------------------------------------------------------------
-# 4. Place Call (Only if in stock)
+# 5. Place Call (Only if in stock)
 # ------------------------------------------------------------------------
 def place_call(message: str):
     """
@@ -130,18 +150,15 @@ def place_call(message: str):
         print(f"Error placing call: {e}")
 
 # ------------------------------------------------------------------------
-# 5. Shared Logic (Monitor-Style)
+# 6. Shared Logic (Monitor-Style)
 # ------------------------------------------------------------------------
 def handle_status_change(current_status, last_status):
     """
-    This is the same logic used by monitor mode to handle status changes:
-      - Only call if in_stock
-      - Just print for sold_out / fail
-      - If no change, we say 'No change'.
+    Only calls if in_stock; prints messages otherwise.
+    If no change, prints 'No change.'
     Returns the updated last_status after applying logic.
     """
     if current_status != last_status:
-        # There's a change
         if current_status == "in_stock":
             place_call("Hurry. The 5090 is now in stock at Best Buy.")
         elif current_status == "sold_out":
@@ -155,34 +172,38 @@ def handle_status_change(current_status, last_status):
         return last_status
 
 # ------------------------------------------------------------------------
-# 6. Monitor Mode
+# 7. Monitor Mode
 # ------------------------------------------------------------------------
 def monitor_mode():
     """
-    Repeatedly checks Best Buy every WAIT_TIME seconds,
-    and uses handle_status_change() for consistent logic.
+    Repeatedly checks Best Buy, then sleeps for a variable interval:
+      - M-F, 6am-1:59pm PT => 1 minute
+      - Else => 10 minutes
+    Uses handle_status_change() for consistent logic.
     """
     last_status = None
-    print(f"Starting monitor mode. Checking every {WAIT_TIME} second(s). Press Ctrl+C to stop.\n")
+    print("Starting monitor mode. Will choose interval based on day/time (PT). Press Ctrl+C to stop.\n")
 
     while True:
         current_status = check_status(save_html=False)
-        # Use the shared logic block:
         last_status = handle_status_change(current_status, last_status)
-        time.sleep(WAIT_TIME)
+
+        wait_time_seconds = get_current_wait_time_seconds()
+        print(f"Next check in {wait_time_seconds/60:.1f} minute(s)...\n")
+        time.sleep(wait_time_seconds)
 
 # ------------------------------------------------------------------------
-# 7. Test Interactive Mode
+# 8. Test Interactive Mode
 # ------------------------------------------------------------------------
 def test_interactive_mode():
     """
     Lets you:
-      - 's'/'i'/'f': Force that status and run the same logic as monitor mode.
+      - 's'/'i'/'f': Force that status, run the same logic as monitor mode.
       - [Enter] -> fetch real page + run same logic.
       - 'q' -> quit
     """
     saved_files_queue = deque(maxlen=MAX_SAVED_RESPONSES)
-    last_status = None  # We'll track changes just like monitor mode
+    last_status = None
 
     print("Entering TEST INTERACTIVE MODE.")
     print("Options:")
@@ -200,17 +221,14 @@ def test_interactive_mode():
             break
 
         elif user_input in ["s", "i", "f"]:
-            # We forced a status
             forced_status = {
                 "s": "sold_out",
                 "i": "in_stock",
                 "f": "fail"
             }[user_input]
-
             last_status = handle_status_change(forced_status, last_status)
 
         elif user_input == "":
-            # fetch real page + same logic
             current_status = check_status(save_html=True, saved_files_queue=saved_files_queue)
             last_status = handle_status_change(current_status, last_status)
 
@@ -218,12 +236,12 @@ def test_interactive_mode():
             print("Unrecognized input. Try again.\n")
 
 # ------------------------------------------------------------------------
-# 8. Main Launcher
+# 9. Main Launcher
 # ------------------------------------------------------------------------
 if __name__ == "__main__":
     print("Select a Mode:\n")
-    print("1) Monitor Mode (checks every X seconds, calls if in stock, else prints)")
-    print("2) Test Interactive Mode (force statuses or fetch page, same logic as monitor)")
+    print("1) Monitor Mode (variable intervals based on weekday/time PT)")
+    print("2) Test Interactive Mode (force statuses or fetch page, same logic)")
     mode_choice = input("Enter 1 or 2: ").strip()
 
     if mode_choice == "1":
